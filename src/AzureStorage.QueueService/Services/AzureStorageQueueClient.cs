@@ -88,7 +88,7 @@ public sealed class AzureStorageQueueClient
     public async ValueTask<ReceiveMessagesResult> ReceiveMessagesAsync<TMessage>(
         Func<List<TMessage?>, ValueTask> handlePreprocess,
         Func<TMessage?, ValueTask> handleMessage,
-        Func<Exception, ValueTask> handleException,
+        Func<Exception, TMessage?, string?, ValueTask> handleException,
         Func<List<TMessage?>, List<TMessage?>, ValueTask> handlePostprocess,
         bool postDeletion = true,
         int numMessages = 1,
@@ -101,14 +101,14 @@ public sealed class AzureStorageQueueClient
         var processedMessages = new List<TMessage?>();
      
 
-        QueueMessage[] receivedMessages = await _queueClient.ReceiveMessagesAsync(numMessages, null, cancellationToken);
+        QueueMessage[] queueMessages = await _queueClient.ReceiveMessagesAsync(numMessages, null, cancellationToken);
 
-        if (receivedMessages.Any())
+        if (queueMessages.Any())
         {
-            _logger.LogMessageCount(receivedMessages.Length);
+            _logger.LogMessageCount(queueMessages.Length);
             
             var messages = new List<TMessage?>();
-            foreach (var receivedMessage in receivedMessages)
+            foreach (var receivedMessage in queueMessages)
             {
                 try
                 {
@@ -117,24 +117,24 @@ public sealed class AzureStorageQueueClient
                 }
                 catch (Exception ex)
                 {
-                    await handleException(ex);
+                    await handleException(ex, null, receivedMessage.MessageId);
                 }
             }
             
             await handlePreprocess(messages);
 
-            for (var index = 0; index < receivedMessages.Length; ++index)
-                await ProcessMessage(receivedMessages[index], messages[index]);
+            for (var index = 0; index < queueMessages.Length; ++index)
+                await ProcessMessage(queueMessages[index], messages[index]);
             
             await handlePostprocess(processedMessages, exceptionMessages);
             
-            foreach (var processedQueueMessage in processedQueueMessages)
-                await PostDeleteMessage(processedQueueMessage);
+            for (var index = 0; index < queueMessages.Length; ++index)
+                await PostDeleteMessage(queueMessages[index], messages[index]);
         }
 
         return new ReceiveMessagesResult()
         {
-            QueueMessageCount = receivedMessages.Length,
+            QueueMessageCount = queueMessages.Length,
             DeletedQueueMessageCount = deletedQueueMessages.Count,
             ProcessedMessageCount = processedMessages.Count,
             ExceptionMessageCount = exceptionMessages.Count
@@ -158,11 +158,11 @@ public sealed class AzureStorageQueueClient
             {
                 // exceptionQueueMessages.Add(queueMessage);
                 exceptionMessages.Add(message);
-                await handleException(ex);
+                await handleException(ex, message, queueMessage.MessageId);
             }
         }
         
-        async Task PostDeleteMessage(QueueMessage queueMessage)
+        async Task PostDeleteMessage(QueueMessage queueMessage, TMessage message)
         {
             try
             {
@@ -171,7 +171,7 @@ public sealed class AzureStorageQueueClient
             }
             catch (Exception ex)
             {
-                await handleException(ex);
+                await handleException(ex, message, queueMessage.MessageId);
             }
         }
     }
