@@ -13,23 +13,28 @@ public sealed class AzureStorageQueueClient
     private readonly QueueClient _queueClient;
     private readonly ILogger<AzureStorageQueueClient> _logger;
 
-    internal AzureStorageQueueClient(IMessageConverter messageConverter, QueueClient queueClient, ILogger<AzureStorageQueueClient> logger)
+    internal AzureStorageQueueClient(IMessageConverter messageConverter, QueueClient queueClient,
+        ILogger<AzureStorageQueueClient> logger)
     {
         _messageConverter = messageConverter;
         _queueClient = queueClient;
         _logger = logger;
     }
 
-    public async ValueTask CreateQueueIfNotExistsAsync(IDictionary<string, string>? metadata = null, CancellationToken cancellationToken = default) =>
+    public async ValueTask CreateQueueIfNotExistsAsync(IDictionary<string, string>? metadata = null,
+        CancellationToken cancellationToken = default) =>
         await _queueClient.CreateIfNotExistsAsync(metadata, cancellationToken);
 
     public async ValueTask ClearMessagesAsync(CancellationToken cancellationToken = default) =>
         await _queueClient.ClearMessagesAsync(cancellationToken);
 
-    public async ValueTask<IEnumerable<TMessage>> PeekMessagesAsync<TMessage>(int numMessages, CancellationToken cancellationToken = default) => 
-        (await _queueClient.PeekMessagesAsync(numMessages, cancellationToken)).Value.Convert<TMessage>(_messageConverter);
+    public async ValueTask<IEnumerable<TMessage>> PeekMessagesAsync<TMessage>(int numMessages,
+        CancellationToken cancellationToken = default) =>
+        (await _queueClient.PeekMessagesAsync(numMessages, cancellationToken)).Value.Convert<TMessage>(
+            _messageConverter);
 
-    public IEnumerable<TMessage> PeekMessages<TMessage>(int numMessages, CancellationToken cancellationToken = default) => 
+    public IEnumerable<TMessage>
+        PeekMessages<TMessage>(int numMessages, CancellationToken cancellationToken = default) =>
         _queueClient.PeekMessages(numMessages, cancellationToken).Value.Convert<TMessage>(_messageConverter);
 
     /// <summary>
@@ -43,7 +48,11 @@ public sealed class AzureStorageQueueClient
     /// <param name="numMessages"></param>
     /// <returns></returns>
     /// <exception cref="Exception"></exception>
-    public async ValueTask ReceiveMessagesAsync<TMessage>(Func<TMessage?, ValueTask> handleMessage, Func<Exception, ValueTask> handleException, int numMessages = 1, CancellationToken cancellationToken = default)
+    public async ValueTask ReceiveMessagesAsync<TMessage>(
+        Func<TMessage?, ValueTask> handleMessage,
+        Func<Exception, ValueTask> handleException,
+        int numMessages = 1,
+        CancellationToken cancellationToken = default)
         where TMessage : class
     {
         QueueMessage[] receivedMessages = await _queueClient.ReceiveMessagesAsync(numMessages, null, cancellationToken);
@@ -65,7 +74,8 @@ public sealed class AzureStorageQueueClient
                     await handleMessage(convertedMessage);
 
                     _logger.LogProcessedMessage(queueMessage.MessageId);
-                    await _queueClient.DeleteMessageAsync(queueMessage.MessageId, queueMessage.PopReceipt, cancellationToken);
+                    await _queueClient.DeleteMessageAsync(queueMessage.MessageId, queueMessage.PopReceipt,
+                        cancellationToken);
                 }
                 catch (Exception e)
                 {
@@ -75,6 +85,98 @@ public sealed class AzureStorageQueueClient
         }
     }
 
+    public async ValueTask<ReceiveMessagesResult> ReceiveMessagesAsync<TMessage>(
+        Func<List<TMessage?>, ValueTask> handlePreprocess,
+        Func<TMessage?, ValueTask> handleMessage,
+        Func<Exception, ValueTask> handleException,
+        Func<List<TMessage?>, List<TMessage?>, ValueTask> handlePostprocess,
+        bool postDeletion = true,
+        int numMessages = 1,
+        CancellationToken cancellationToken = default(CancellationToken))
+        where TMessage : class
+    {
+        var processedQueueMessages = new List<QueueMessage>();
+        var deletedQueueMessages = new List<QueueMessage>();
+        var exceptionMessages = new List<TMessage?>();
+        var processedMessages = new List<TMessage?>();
+     
+
+        QueueMessage[] receivedMessages = await _queueClient.ReceiveMessagesAsync(numMessages, null, cancellationToken);
+
+        if (receivedMessages.Any())
+        {
+            _logger.LogMessageCount(receivedMessages.Length);
+            
+            var messages = new List<TMessage?>();
+            foreach (var receivedMessage in receivedMessages)
+            {
+                try
+                {
+                    var convertedMessage = _messageConverter.Convert<TMessage>(receivedMessage.MessageText);
+                    messages.Add(convertedMessage);
+                }
+                catch (Exception ex)
+                {
+                    await handleException(ex);
+                }
+            }
+            
+            await handlePreprocess(messages);
+
+            for (var index = 0; index < receivedMessages.Length; ++index)
+                await ProcessMessage(receivedMessages[index], messages[index]);
+            
+            await handlePostprocess(processedMessages, exceptionMessages);
+            
+            foreach (var processedQueueMessage in processedQueueMessages)
+                await PostDeleteMessage(processedQueueMessage);
+        }
+
+        return new ReceiveMessagesResult()
+        {
+            QueueMessageCount = receivedMessages.Length,
+            DeletedQueueMessageCount = deletedQueueMessages.Count,
+            ProcessedMessageCount = processedMessages.Count,
+            ExceptionMessageCount = exceptionMessages.Count
+        };
+        
+        
+        async Task ProcessMessage(QueueMessage queueMessage, TMessage? message)
+        {
+            try
+            {
+                await handleMessage(message);
+                
+                processedQueueMessages.Add(queueMessage);
+                processedMessages.Add(message);
+                
+                _logger.LogProcessedMessage(queueMessage.MessageId);
+                if(!postDeletion)
+                    await _queueClient.DeleteMessageAsync(queueMessage.MessageId, queueMessage.PopReceipt, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                // exceptionQueueMessages.Add(queueMessage);
+                exceptionMessages.Add(message);
+                await handleException(ex);
+            }
+        }
+        
+        async Task PostDeleteMessage(QueueMessage queueMessage)
+        {
+            try
+            {
+                await this._queueClient.DeleteMessageAsync(queueMessage.MessageId, queueMessage.PopReceipt, cancellationToken);
+                deletedQueueMessages.Add(queueMessage);
+            }
+            catch (Exception ex)
+            {
+                await handleException(ex);
+            }
+        }
+    }
+
+
     /// <summary>
     /// Sends a message of a specified type and handles serialization of the message to the correct format.
     /// </summary>
@@ -83,7 +185,8 @@ public sealed class AzureStorageQueueClient
     /// <param name="cancellationToken"></param>
     /// <returns><see cref="SendResponse"/></returns>
     /// <exception cref="Exception"></exception>
-    public async ValueTask<SendResponse> SendMessageAsync<TMessage>(TMessage message, CancellationToken cancellationToken = default)
+    public async ValueTask<SendResponse> SendMessageAsync<TMessage>(TMessage message,
+        CancellationToken cancellationToken = default)
     {
         try
         {
