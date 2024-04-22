@@ -95,14 +95,22 @@ public sealed class AzureStorageQueueClient
         CancellationToken cancellationToken = default(CancellationToken))
         where TMessage : class
     {
-        var processedQueueMessages = new List<QueueMessage>();
+        // var processedQueueMessages = new List<QueueMessage>();
         var deletedQueueMessages = new List<QueueMessage>();
         var exceptionMessages = new List<TMessage?>();
         var processedMessages = new List<TMessage?>();
-     
 
-        QueueMessage[] queueMessages = await _queueClient.ReceiveMessagesAsync(numMessages, null, cancellationToken);
-
+        QueueMessage[] queueMessages;
+        try
+        {
+            queueMessages = await _queueClient.ReceiveMessagesAsync(numMessages, null, cancellationToken);
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(e, $"{nameof(QueueClient.ReceiveMessagesAsync)} failed.");
+            throw;
+        }
+        
         if (queueMessages.Any())
         {
             _logger.LogMessageCount(queueMessages.Length);
@@ -129,12 +137,13 @@ public sealed class AzureStorageQueueClient
             await handlePostprocess(processedMessages, exceptionMessages);
             
             for (var index = 0; index < queueMessages.Length; ++index)
-                await PostDeleteMessage(queueMessages[index], messages[index]);
+                await PostDeleteMessage(queueMessages[index], messages[index]!);
         }
 
         return new ReceiveMessagesResult()
         {
-            QueueMessageCount = queueMessages.Length,
+            RequestedMessageCount = numMessages,
+            ReceivedMessageCount = queueMessages.Length,
             DeletedQueueMessageCount = deletedQueueMessages.Count,
             ProcessedMessageCount = processedMessages.Count,
             ExceptionMessageCount = exceptionMessages.Count
@@ -147,7 +156,7 @@ public sealed class AzureStorageQueueClient
             {
                 await handleMessage(message);
                 
-                processedQueueMessages.Add(queueMessage);
+                // processedQueueMessages.Add(queueMessage);
                 processedMessages.Add(message);
                 
                 _logger.LogProcessedMessage(queueMessage.MessageId);
@@ -166,7 +175,7 @@ public sealed class AzureStorageQueueClient
         {
             try
             {
-                await this._queueClient.DeleteMessageAsync(queueMessage.MessageId, queueMessage.PopReceipt, cancellationToken);
+                // await this._queueClient.DeleteMessageAsync(queueMessage.MessageId, queueMessage.PopReceipt, cancellationToken);
                 deletedQueueMessages.Add(queueMessage);
             }
             catch (Exception ex)
