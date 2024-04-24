@@ -1,4 +1,5 @@
-﻿using Azure.Storage.Queues;
+﻿using Azure;
+using Azure.Storage.Queues;
 using Azure.Storage.Queues.Models;
 using JasonShave.AzureStorage.QueueService.Extensions;
 using JasonShave.AzureStorage.QueueService.Interfaces;
@@ -85,36 +86,82 @@ public sealed class AzureStorageQueueClient
         }
     }
 
-    public async ValueTask<ReceiveMessagesResult> ReceiveMessagesAsync<TMessage>(
+    public async ValueTask<int> ApproximateMessagesCountAsync(CancellationToken cancellationToken)
+    {
+        QueueProperties properties = await _queueClient.GetPropertiesAsync(cancellationToken);
+
+        return properties.ApproximateMessagesCount;
+    }
+
+    const double AzureMaxNumMessages = 32.0;
+    public async ValueTask<int> ReceiveMessagesAsync<TMessage>(
         Func<List<TMessage?>, ValueTask> handlePreprocess,
         Func<TMessage?, ValueTask> handleMessage,
         Func<Exception, TMessage?, string?, ValueTask> handleException,
         Func<List<TMessage?>, List<TMessage?>, ValueTask> handlePostprocess,
+        Func<TMessage?, ValueTask<bool>>? handlePostDeletion,
         bool postDeletion = true,
         int numMessages = 1,
         CancellationToken cancellationToken = default(CancellationToken))
         where TMessage : class
     {
         // var processedQueueMessages = new List<QueueMessage>();
-        var deletedQueueMessages = new List<QueueMessage>();
+        // var deletedQueueMessages = new List<QueueMessage>();
         var exceptionMessages = new List<TMessage?>();
         var processedMessages = new List<TMessage?>();
-
         QueueMessage[] queueMessages;
-        try
+
+        
+        if (numMessages > AzureMaxNumMessages)
         {
-            queueMessages = await _queueClient.ReceiveMessagesAsync(numMessages, null, cancellationToken);
+            var approximateMessages = await ApproximateMessagesCountAsync(cancellationToken);
+            if (approximateMessages == 0)
+                return 0;
+
+            var requestsCount = Math.Ceiling(approximateMessages / AzureMaxNumMessages);
+            var tasks = new List<Task<Response<QueueMessage[]>>>();
+            for (var index = 0; index < requestsCount; index++)
+            {
+                var task = _queueClient.ReceiveMessagesAsync(32, null, cancellationToken);
+                tasks.Add(task);
+            }
+
+            var batchQueueMessages = new List<QueueMessage>();
+            foreach (var task in tasks)
+            {
+                QueueMessage[] batchItemQueueMessages;
+                try
+                {
+                    batchItemQueueMessages = await task;
+                }
+                catch (Exception e)
+                {
+                    _logger.LogError(e, $"{nameof(QueueClient.ReceiveMessagesAsync)} failed.");
+                    throw;
+                }
+
+                batchQueueMessages.AddRange(batchItemQueueMessages);
+            }
+
+            queueMessages = batchQueueMessages.ToArray();
         }
-        catch (Exception e)
+        else
         {
-            _logger.LogError(e, $"{nameof(QueueClient.ReceiveMessagesAsync)} failed.");
-            throw;
+            try
+            {
+                queueMessages = await _queueClient.ReceiveMessagesAsync(numMessages, null, cancellationToken);
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, $"{nameof(QueueClient.ReceiveMessagesAsync)} failed.");
+                throw;
+            }
         }
         
         if (queueMessages.Any())
         {
             _logger.LogMessageCount(queueMessages.Length);
-            
+
             var messages = new List<TMessage?>();
             foreach (var receivedMessage in queueMessages)
             {
@@ -128,40 +175,55 @@ public sealed class AzureStorageQueueClient
                     await handleException(ex, null, receivedMessage.MessageId);
                 }
             }
-            
+
             await handlePreprocess(messages);
 
             for (var index = 0; index < queueMessages.Length; ++index)
                 await ProcessMessage(queueMessages[index], messages[index]);
-            
+
             await handlePostprocess(processedMessages, exceptionMessages);
-            
+
+            // If handlePostprocess throws an exception, PostDeleteMessage is not called
             for (var index = 0; index < queueMessages.Length; ++index)
+            {
                 await PostDeleteMessage(queueMessages[index], messages[index]!);
+            }
         }
 
-        return new ReceiveMessagesResult()
-        {
-            RequestedMessageCount = numMessages,
-            ReceivedMessageCount = queueMessages.Length,
-            DeletedQueueMessageCount = deletedQueueMessages.Count,
-            ProcessedMessageCount = processedMessages.Count,
-            ExceptionMessageCount = exceptionMessages.Count
-        };
-        
-        
+        // return new ReceiveMessagesResult()
+        // {
+        //     RequestedMessageCount = numMessages,
+        //     ReceivedMessageCount = queueMessages.Length,
+        //     DeletedQueueMessageCount = deletedQueueMessages.Count,
+        //     ProcessedMessageCount = processedMessages.Count,
+        //     ExceptionMessageCount = exceptionMessages.Count
+        // };
+
+        return queueMessages.Length;
+
+
         async Task ProcessMessage(QueueMessage queueMessage, TMessage? message)
         {
             try
             {
                 await handleMessage(message);
-                
+
                 // processedQueueMessages.Add(queueMessage);
                 processedMessages.Add(message);
-                
+
                 _logger.LogProcessedMessage(queueMessage.MessageId);
-                if(!postDeletion)
-                    await _queueClient.DeleteMessageAsync(queueMessage.MessageId, queueMessage.PopReceipt, cancellationToken);
+                if (!postDeletion)
+                {
+                    if (handlePostDeletion != null)
+                    {
+                        var delete = await handlePostDeletion(message);
+                        if(delete == false)
+                            return;
+                    }
+                    
+                    await _queueClient.DeleteMessageAsync(queueMessage.MessageId, queueMessage.PopReceipt,
+                        cancellationToken);
+                }
             }
             catch (Exception ex)
             {
@@ -170,13 +232,20 @@ public sealed class AzureStorageQueueClient
                 await handleException(ex, message, queueMessage.MessageId);
             }
         }
-        
+
         async Task PostDeleteMessage(QueueMessage queueMessage, TMessage message)
         {
             try
             {
-                // await this._queueClient.DeleteMessageAsync(queueMessage.MessageId, queueMessage.PopReceipt, cancellationToken);
-                deletedQueueMessages.Add(queueMessage);
+                if (handlePostDeletion != null)
+                {
+                    var delete = await handlePostDeletion(message);
+                    if(delete == false)
+                        return;
+                }
+                
+                await this._queueClient.DeleteMessageAsync(queueMessage.MessageId, queueMessage.PopReceipt, cancellationToken);
+                //deletedQueueMessages.Add(queueMessage);
             }
             catch (Exception ex)
             {
